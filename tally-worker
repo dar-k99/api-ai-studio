@@ -1,1 +1,265 @@
+/**
+ * ============================================================
+ * Buzzeasy → AI Studio  |  Cloudflare Worker
+ * ============================================================
+ *
+ * FLOW:
+ *  1. Buzzeasy Custom Integration Node POSTs to this Worker URL
+ *     with a ?channelId= query param identifying the channel.
+ *  2. Worker validates the incoming x-api-key from Buzzeasy.
+ *  3. Worker maps channelId → channel name.
+ *  4. Worker obtains a Buzzeasy OAuth2 Bearer token.
+ *  5. Worker fetches the full conversation history.
+ *  6. Worker forwards the enriched payload to AI Studio.
+ *
+ * CUSTOM INTEGRATION NODE SETUP (one per channel workflow):
+ * ─────────────────────────────────────────────────────────────
+ *  m1    URL: https://<your-worker>.workers.dev?channelId=2000785
+ *  m2    URL: https://<your-worker>.workers.dev?channelId=2000786
+ *  m3_hs URL: https://<your-worker>.workers.dev?channelId=2000792
+ *  m4_cs URL: https://<your-worker>.workers.dev?channelId=2000793
+ *
+ *  API Key field: same value as BUZZEASY_WEBHOOK_SECRET below
+ *
+ * ENVIRONMENT SECRETS  (set via: wrangler secret put <NAME>)
+ * ─────────────────────────────────────────────────────────────
+ *  BUZZEASY_WEBHOOK_SECRET   – API key you enter in each Custom Integration node
+ *  BUZZEASY_CLIENT_ID        – OAuth2 client ID from Buzzeasy
+ *  BUZZEASY_CLIENT_SECRET    – OAuth2 client secret from Buzzeasy
+ *  AI_STUDIO_API_KEY         – Your AI Studio API key
+ * ============================================================
+ */
 
+// ── Channel map ──────────────────────────────────────────────
+
+const CHANNEL_MAP = {
+  "2000785": "m1",
+  "2000786": "m2",
+  "2000792": "m3_hs",
+  "2000793": "m4_cs",
+};
+
+const TENANT_ID = "67a49d779a5028ecdc4c3698";
+
+// ── Configuration ────────────────────────────────────────────
+
+const BUZZEASY_TOKEN_URL =
+  "https://geoauth-prod.geomant.cloud/connect/token";
+
+// Confirmed from browser DevTools
+const BUZZEASY_CONVERSATION_API_BASE =
+  "https://api-prod.geomant.cloud/content/v2/conversationhistory/full";
+
+const AI_STUDIO_URL =
+  "https://api-prod.geomant.cloud/buzzeasy-middleware/bmw" +
+  "?aisHost=ai-studio.graia.ai%2Fbackend-studio" +
+  "&aisFlowId=74bda5d3-89ca-4c38-adbf-d479dd85264c";
+
+// In-memory token cache
+let cachedToken = null;
+let tokenExpiresAt = 0;
+
+// ── Main handler ─────────────────────────────────────────────
+
+export default {
+  async fetch(request, env) {
+    if (request.method !== "POST") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
+
+    // ── Step 1: Validate API key from Custom Integration node ─
+    const incomingKey = request.headers.get("x-api-key");
+    if (!incomingKey || incomingKey !== env.BUZZEASY_WEBHOOK_SECRET) {
+      console.error("Unauthorized: invalid or missing x-api-key");
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    // ── Step 2: Read channelId from query string ──────────────
+    const { searchParams } = new URL(request.url);
+    const channelId = searchParams.get("channelId");
+
+    if (!channelId) {
+      return new Response("Bad Request: missing channelId query param", {
+        status: 400,
+      });
+    }
+
+    const channelName = CHANNEL_MAP[channelId];
+    if (!channelName) {
+      console.warn(`Unknown channelId: ${channelId} — ignoring`);
+      return new Response("Ignored: unknown channel", { status: 200 });
+    }
+
+    // ── Step 3: Parse the Custom Integration node payload ─────
+    // Buzzeasy sends: { conversationId, channelType, customerId,
+    //                   customerIdentifier, workflowData }
+    let hookPayload;
+    try {
+      hookPayload = await request.json();
+    } catch {
+      return new Response("Bad Request: invalid JSON", { status: 400 });
+    }
+
+    // Custom Integration Node uses "conversationId" directly
+    const conversationId =
+      hookPayload.conversationId ?? hookPayload.primaryConversationId;
+
+    if (!conversationId) {
+      console.error("No conversationId in payload", hookPayload);
+      return new Response("Bad Request: missing conversationId", {
+        status: 400,
+      });
+    }
+
+    console.log(
+      `[${channelName}] Processing conversation: ${conversationId}`,
+      { channelId, channelType: hookPayload.channelType }
+    );
+
+    // ── Step 4: Get Buzzeasy OAuth2 token ────────────────────
+    let buzzeasyToken;
+    try {
+      buzzeasyToken = await getBuzzeasyToken(env);
+    } catch (err) {
+      console.error("Failed to get Buzzeasy token:", err.message);
+      return new Response("Internal Server Error: auth failed", { status: 502 });
+    }
+
+    // ── Step 5: Fetch full conversation history ───────────────
+    let conversationHistory;
+    try {
+      conversationHistory = await fetchConversationHistory(
+        conversationId,
+        buzzeasyToken
+      );
+    } catch (err) {
+      console.error("Failed to fetch conversation history:", err.message);
+      return new Response("Internal Server Error: fetch failed", { status: 502 });
+    }
+
+    // ── Step 6: Forward to AI Studio ─────────────────────────
+    const aiStudioPayload = buildAiStudioPayload(
+      hookPayload,
+      conversationHistory,
+      channelId,
+      channelName
+    );
+
+    try {
+      await forwardToAiStudio(aiStudioPayload, env);
+    } catch (err) {
+      console.error("Failed to forward to AI Studio:", err.message);
+      return new Response("Internal Server Error: forward failed", { status: 502 });
+    }
+
+    console.log(
+      `✓ [${channelName}] Conversation ${conversationId} forwarded to AI Studio`
+    );
+
+    // Buzzeasy expects a JSON response from the Custom Integration node
+    return new Response(
+      JSON.stringify({ success: true, conversationId, channelId, channelName }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  },
+};
+
+// ── OAuth2 Token (with in-memory cache) ──────────────────────
+
+async function getBuzzeasyToken(env) {
+  const now = Date.now();
+
+  if (cachedToken && now < tokenExpiresAt - 60_000) {
+    return cachedToken;
+  }
+
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: env.BUZZEASY_CLIENT_ID,
+    client_secret: env.BUZZEASY_CLIENT_SECRET,
+    scope: "buzzeasy",
+  });
+
+  const res = await fetch(BUZZEASY_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Token request failed (${res.status}): ${err}`);
+  }
+
+  const data = await res.json();
+  cachedToken = data.access_token;
+  tokenExpiresAt = now + data.expires_in * 1000;
+
+  return cachedToken;
+}
+
+// ── Fetch conversation history ────────────────────────────────
+
+async function fetchConversationHistory(conversationId, token) {
+  // ⚠️  Confirm exact path from your Buzzeasy Conversation History Swagger UI
+  const url = `${BUZZEASY_CONVERSATION_API_BASE}/${conversationId}`;
+
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+    },
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Conversation fetch failed (${res.status}): ${err}`);
+  }
+
+  return await res.json();
+}
+
+// ── Build AI Studio payload ───────────────────────────────────
+
+function buildAiStudioPayload(hookPayload, conversationHistory, channelId, channelName) {
+  return {
+    // Channel identification
+    channel: {
+      id: channelId,
+      name: channelName,
+      tenantId: TENANT_ID,
+    },
+    // Conversation metadata from Custom Integration node payload
+    conversationId: hookPayload.conversationId,
+    channelType: hookPayload.channelType,
+    customer: {
+      id: hookPayload.customerId ?? null,
+      identifier: hookPayload.customerIdentifier ?? null,
+    },
+    // Any workflow variables Buzzeasy collected before this node
+    workflowData: hookPayload.workflowData ?? {},
+    // Full message history from Conversation History API
+    messages: conversationHistory,
+    processedAt: new Date().toISOString(),
+  };
+}
+
+// ── Forward to AI Studio ──────────────────────────────────────
+
+async function forwardToAiStudio(payload, env) {
+  const res = await fetch(AI_STUDIO_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": env.AI_STUDIO_API_KEY,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`AI Studio rejected payload (${res.status}): ${err}`);
+  }
+
+  return res;
+}
